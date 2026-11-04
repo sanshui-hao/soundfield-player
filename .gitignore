@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local music library (never publish the audio files)
+*.mp3
+*.m4a
+*.m4b
+*.aac
+*.flac
+*.wav
+*.wave
+*.ogg
+*.oga
+*.opus
+*.wma
+*.aiff
+*.aif
+*.ape
+*.dsf
+*.dff
+*.alac
+周杰伦歌单/
+孙燕姿歌单/
+
+# Local lyrics (copyrighted content)
+*.lrc
+
+# Screenshots containing the user's album artwork
+preview-*.png
+
+# Windows launcher with an absolute local path
+启动声场.lnk
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
