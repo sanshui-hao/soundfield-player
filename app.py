@@ -1140,16 +1140,29 @@ def api_health():
     return jsonify({"ok": True, "app": "soundfield", "version": "1.0.0"})
 
 
-def _pick_port(start: int = 8765, count: int = 20) -> int:
+def _pick_port(start: int = 8765, count: int = 20, host: str = "127.0.0.1") -> int:
+    bind_host = "127.0.0.1" if host == "localhost" else host
     for port in range(start, start + count):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                sock.bind(("127.0.0.1", port))
+                sock.bind((bind_host, port))
                 return port
             except OSError:
                 continue
     raise RuntimeError("找不到可用端口")
+
+
+def _lan_ip() -> str:
+    """Best-effort LAN address for the phone-access URL."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        sock.close()
 
 
 def _open_browser_when_ready(url: str, port: int) -> None:
@@ -1175,21 +1188,32 @@ def _open_browser_when_ready(url: str, port: int) -> None:
 
 def main():
     library.scan()
-    port = _pick_port()
-    url = f"http://127.0.0.1:{port}/"
+    host = os.environ.get("SOUNDFIELD_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    if host == "localhost":
+        host = "127.0.0.1"
+    port = _pick_port(host=host)
+    local_url = f"http://127.0.0.1:{port}/"
+    phone_host = _lan_ip() if host == "0.0.0.0" else host
+    phone_url = f"http://{phone_host}:{port}/"
+    lan_mode = host != "127.0.0.1"
     print("")
     print("  声场 · SOUNDFIELD")
     print("  ------------------------------------------")
     print(f"  曲库目录  {BASE_DIR}")
     print(f"  曲目数量  {len(library.tracks)} 首")
-    print(f"  播放地址  {url}")
-    print("  如果浏览器没有自动打开，请手动访问上面的地址")
+    print(f"  本机地址  {local_url}")
+    if lan_mode:
+        print(f"  手机访问  {phone_url}")
+        print("  手机和电脑需要连接同一个 Wi-Fi")
+        print("  Windows 防火墙请允许 Python 访问专用网络")
+        print("  同一网络中的人也能访问，请只在可信网络使用")
+    print("  如果浏览器没有自动打开，请手动访问上面的本机地址")
     print("  关闭此窗口即可停止播放器")
     print("  ------------------------------------------")
     print("")
     if os.environ.get("SOUNDFIELD_NO_BROWSER") != "1":
-        threading.Thread(target=_open_browser_when_ready, args=(url, port), daemon=True).start()
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True, use_reloader=False)
+        threading.Thread(target=_open_browser_when_ready, args=(local_url, port), daemon=True).start()
+    app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__":
