@@ -8,10 +8,13 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import html
 import json
 import mimetypes
 import os
 import re
+import secrets
 import socket
 import struct
 import threading
@@ -20,10 +23,13 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import quote
 
-from flask import Flask, Response, abort, jsonify, request, send_file
+from flask import Flask, Response, abort, jsonify, redirect, request, send_file, session
+
+mimetypes.add_type("application/manifest+json", ".webmanifest")
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
@@ -32,7 +38,7 @@ AUDIO_EXTS = {
     ".ogg", ".oga", ".opus", ".wma", ".aiff", ".aif", ".ape",
     ".dsf", ".dff", ".alac",
 }
-SKIP_DIRS = {"web", "__pycache__", "node_modules", ".git", ".idea", ".vscode"}
+SKIP_DIRS = {"web", "tools", "__pycache__", "node_modules", ".git", ".idea", ".vscode"}
 MIME_OVERRIDES = {
     ".m4a": "audio/mp4", ".m4b": "audio/mp4", ".aac": "audio/aac",
     ".flac": "audio/flac", ".opus": "audio/ogg", ".oga": "audio/ogg",
@@ -45,6 +51,155 @@ app = Flask(__name__, static_folder=str(WEB_DIR), static_url_path="/static")
 app.json.ensure_ascii = False
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+app.config.update(
+    SESSION_COOKIE_NAME="sf_session",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=180),
+)
+if os.environ.get("SOUNDFIELD_HTTPS") == "1":
+    # 远程模式走 Cloudflare 的 HTTPS，Cookie 只在 HTTPS 下发送
+    app.config["SESSION_COOKIE_SECURE"] = True
+
+# 只有在启动远程访问（或手动设置环境变量）时才需要访问码。
+# 普通「启动播放器」没有任何登录步骤，和以前完全一样。
+ACCESS_CODE = os.environ.get("SOUNDFIELD_ACCESS_CODE", "").strip()
+if ACCESS_CODE:
+    app.secret_key = os.environ.get("SOUNDFIELD_SECRET_KEY", "").strip() or secrets.token_hex(32)
+
+LOGIN_WINDOW_SECONDS = 5 * 60
+LOGIN_MAX_FAILURES = 12
+_login_failures: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _client_ip() -> str:
+    """真实客户端地址。经过 Cloudflare 隧道时 remote_addr 是本机，需要用请求头。"""
+    return (request.headers.get("CF-Connecting-IP") or request.remote_addr or "").strip()
+
+
+def _is_local_request() -> bool:
+    """是不是电脑本机直接打开的请求（不是隧道转发进来的）。"""
+    if (
+        request.headers.get("CF-Connecting-IP")
+        or request.headers.get("CF-Ray")
+        or request.headers.get("X-Forwarded-For")
+    ):
+        return False
+    return (request.remote_addr or "") in ("127.0.0.1", "::1")
+
+
+def _is_authenticated() -> bool:
+    if not ACCESS_CODE or session.get("sf_access") or _is_local_request():
+        return True
+    return False
+
+
+def _code_matches(value: str) -> bool:
+    return bool(ACCESS_CODE) and hmac.compare_digest(str(value or "").strip(), ACCESS_CODE)
+
+
+def _login_blocked(ip: str) -> bool:
+    now = time.time()
+    with _login_lock:
+        attempts = [stamp for stamp in _login_failures.get(ip, []) if now - stamp < LOGIN_WINDOW_SECONDS]
+        if attempts:
+            _login_failures[ip] = attempts
+        else:
+            _login_failures.pop(ip, None)
+        return len(attempts) >= LOGIN_MAX_FAILURES
+
+
+def _record_login_failure(ip: str) -> None:
+    now = time.time()
+    with _login_lock:
+        attempts = [stamp for stamp in _login_failures.get(ip, []) if now - stamp < LOGIN_WINDOW_SECONDS]
+        attempts.append(now)
+        _login_failures[ip] = attempts
+        if len(_login_failures) > 2000:
+            for key in [k for k, v in _login_failures.items() if not v or now - v[-1] > LOGIN_WINDOW_SECONDS]:
+                _login_failures.pop(key, None)
+
+
+def _clear_login_failures(ip: str) -> None:
+    with _login_lock:
+        _login_failures.pop(ip, None)
+
+
+def _safe_next(value: str | None) -> str:
+    target = (value or "").strip()
+    if target.startswith("/") and not target.startswith("//") and "\\" not in target and "\n" not in target:
+        return target
+    return "/"
+
+
+def _login_page(status: int = 200, message: str = "", next_url: str = "/") -> Response:
+    page = WEB_DIR / "login.html"
+    if not page.exists():
+        return Response("需要访问码，但 web/login.html 缺失。", status=500, mimetype="text/plain")
+    body = page.read_text(encoding="utf-8")
+    body = body.replace("{{ERROR}}", html.escape(message))
+    body = body.replace("{{NEXT}}", html.escape(next_url))
+    response = Response(body, status=status, mimetype="text/html")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.before_request
+def _guard_remote_access():
+    """设置访问码后，所有非本机请求都要先登录；静态资源和登录页除外。"""
+    if not ACCESS_CODE:
+        return None
+    path = request.path
+    if path == "/login" or path == "/favicon.ico" or path.startswith("/static/"):
+        return None
+    if path == "/api/health":
+        return None
+    if _is_local_request() or session.get("sf_access"):
+        return None
+
+    # 二维码里的链接会带 ?code=xxxxxx，扫码后自动登录并把参数从地址栏去掉
+    if request.method == "GET" and "code" in request.args:
+        ip = _client_ip()
+        if _login_blocked(ip):
+            return _login_page(429, "尝试次数过多，请 5 分钟后再试。", "/")
+        if _code_matches(request.args.get("code", "")):
+            session.permanent = True
+            session["sf_access"] = True
+            _clear_login_failures(ip)
+            params = request.args.to_dict(flat=True)
+            params.pop("code", None)
+            target = request.path + (("?" + urllib.parse.urlencode(params)) if params else "")
+            return redirect(_safe_next(target))
+        _record_login_failure(ip)
+        return _login_page(401, "链接里的访问码不正确，请重新扫码。", "/")
+
+    if path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "unauthorized", "login": "/login"}), 401
+    if path == "/":
+        return _login_page(200, "", "/")
+    return redirect("/login?next=" + quote(path, safe=""))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not ACCESS_CODE:
+        return redirect("/")
+    next_url = _safe_next(request.values.get("next"))
+    if request.method == "POST":
+        ip = _client_ip()
+        if _login_blocked(ip):
+            return _login_page(429, "尝试次数过多，请 5 分钟后再试。", next_url)
+        if _code_matches(request.form.get("code", "")):
+            session.permanent = True
+            session["sf_access"] = True
+            _clear_login_failures(ip)
+            return redirect(next_url)
+        _record_login_failure(ip)
+        return _login_page(401, "访问码不正确，请重新输入。", next_url)
+    if _is_authenticated():
+        return redirect(next_url)
+    return _login_page(200, "", next_url)
 
 
 # ---------------------------------------------------------------------------
@@ -982,6 +1137,8 @@ def _headers(resp: Response) -> Response:
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     if request.path.startswith("/api/"):
         resp.headers.setdefault("Cache-Control", "no-store")
+    elif ACCESS_CODE and request.path == "/":
+        resp.headers["Cache-Control"] = "private, no-store"
     return resp
 
 
@@ -1113,6 +1270,8 @@ def api_audio(rel: str):
 
 @app.post("/api/open-folder")
 def api_open_folder():
+    if not _is_local_request():
+        return jsonify({"ok": False, "error": "「打开文件夹」只能在电脑上使用"}), 403
     try:
         payload = request.get_json(silent=True) or {}
         rel = str(payload.get("path") or "").strip()
@@ -1137,7 +1296,12 @@ def api_open_folder():
 
 @app.get("/api/health")
 def api_health():
-    return jsonify({"ok": True, "app": "soundfield", "version": "1.0.0"})
+    return jsonify({
+        "ok": True,
+        "app": "soundfield",
+        "version": "1.0.0",
+        "authRequired": bool(ACCESS_CODE),
+    })
 
 
 def _pick_port(start: int = 8765, count: int = 20, host: str = "127.0.0.1") -> int:
@@ -1191,7 +1355,17 @@ def main():
     host = os.environ.get("SOUNDFIELD_HOST", "127.0.0.1").strip() or "127.0.0.1"
     if host == "localhost":
         host = "127.0.0.1"
-    port = _pick_port(host=host)
+    wanted_port = os.environ.get("SOUNDFIELD_PORT", "").strip()
+    try:
+        if wanted_port.isdigit():
+            port = _pick_port(start=int(wanted_port), count=1, host=host)
+        else:
+            port = _pick_port(host=host)
+    except RuntimeError as exc:
+        print("")
+        print(f"  启动失败：{exc}")
+        print("  请关闭占用 8765 附近端口的程序后重试。")
+        return
     local_url = f"http://127.0.0.1:{port}/"
     phone_host = _lan_ip() if host == "0.0.0.0" else host
     phone_url = f"http://{phone_host}:{port}/"
@@ -1202,6 +1376,8 @@ def main():
     print(f"  曲库目录  {BASE_DIR}")
     print(f"  曲目数量  {len(library.tracks)} 首")
     print(f"  本机地址  {local_url}")
+    if ACCESS_CODE:
+        print("  访问保护  已开启（手机首次访问需要输入访问码）")
     if lan_mode:
         print(f"  手机访问  {phone_url}")
         print("  手机和电脑需要连接同一个 Wi-Fi")

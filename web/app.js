@@ -2,6 +2,21 @@
 (() => {
   'use strict';
 
+  // 远程访问（公网）时，登录过期后的接口请求会返回 401；统一回到登录页。
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    const response = await nativeFetch(input, init);
+    if (response.status === 401) {
+      const raw = typeof input === 'string' ? input : (input && input.url) || '';
+      let sameOrigin = raw.startsWith('/');
+      if (!sameOrigin && raw) {
+        try { sameOrigin = new URL(raw, window.location.href).origin === window.location.origin; } catch (_) { /* ignore */ }
+      }
+      if (sameOrigin) window.location.replace('/login');
+    }
+    return response;
+  };
+
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));

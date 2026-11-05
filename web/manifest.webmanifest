@@ -1,0 +1,25 @@
+{
+  "name": "声场 · SOUNDFIELD",
+  "short_name": "声场",
+  "description": "私人音乐播放器：曲库在电脑上，手机随时听。",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f6f2",
+  "theme_color": "#f7f7f3",
+  "icons": [
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

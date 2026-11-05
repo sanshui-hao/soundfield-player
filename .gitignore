@@ -39,3 +39,15 @@ preview-*.png
 Thumbs.db
 .idea/
 .vscode/
+
+# Remote access local state (contains the access code / session secret)
+.remote-access.json
+.remote-access.json.tmp
+tools/cloudflared.exe
+tools/cloudflared.download
+tools/cloudflared-version.txt
+tools/remote-access.html
+tools/player.log
+tools/tunnel.log
+tools/_clipboard.txt
+.tmp/
